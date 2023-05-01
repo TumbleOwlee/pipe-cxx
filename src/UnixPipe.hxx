@@ -15,11 +15,17 @@
 #include <map>
 #include <functional>
 
+/**
+ * \brief Pipe access type, either read or write
+ */
 enum class PipeAccess {
     Read,
     Write,
 };
 
+/*
+ * \brief Class to transmit/receive messages over a named pipe
+ */
 class UnixPipe {
 public:
     // Initial (and incremental) buffer size for incoming data
@@ -29,30 +35,47 @@ public:
     constexpr static const char* const START = "START";
     constexpr static const char* const END = "END";
 
+    /*
+     * \brief Create a read or write named pipe
+     * \param name Name of the pipe file (path)
+     * \param access Access type, either read or write
+     */
     UnixPipe(std::string const name, PipeAccess access) : m_name(name), m_access(access), m_fd(-1), m_hasToStop(false), m_reader() {
         struct stat st;
         // Check if pipe exists
         if (stat(name.c_str(), &st) == 0) {
+            // Check if given name/path is a valid named pipe
             if (!S_ISFIFO(st.st_mode)) {
                 std::cerr << name << " is not a named pipe." << std::endl;
             }
         } else {
+            // Create new named pipe
             if (mkfifo(name.c_str(), 0666) == -1) {
                 perror("mkfifo");
                 abort();
             }
         }
-        // Open pipe
+        // Open named pipe, use O_RDWR to prevent SIGPIPE on exit of reader
+        // Use O_NONBLOCK for writer to prevent blocking on open call
         m_fd = open(name.c_str(), (access == PipeAccess::Write) ? O_RDWR | O_NONBLOCK : O_RDWR);
     }
 
+    /*
+     * \brief Delete pipe by closing file descriptor and stopping reader thread if active
+     */
     ~UnixPipe() {
+        // If reader thread is running, stop it
         if (m_reader && m_reader->joinable()) {
             m_hasToStop = true;
             m_reader->join();
         }
+        // Close file descriptor
+        close(m_fd);
     }
 
+    /*
+     * \brief Start reader thread for incoming messages
+     */
     void start() {
         // Check if read access
         if (m_access != PipeAccess::Read) {
@@ -64,6 +87,11 @@ public:
         }
     }
 
+    /*
+     * \brief Add callback for a given message identifier
+     * \param id Message identifier to use for the callback
+     * \param callback Callback to call for the message identifier
+     */
     void addCallback(std::string const id, std::function<void(std::string const&)> callback) {
         // Check if read access
         if (m_access != PipeAccess::Read) {
@@ -73,9 +101,15 @@ public:
         if (m_callbacks.find(id) != m_callbacks.end()) {
             throw std::logic_error("Tried to add a second callback for the same identifier.");
         }
+        // Set callback
         m_callbacks[id] = callback;
     }
 
+    /*
+     * \brief Write the message associated with given identifier
+     * \param id Message identifier associated with the message
+     * \param msg Message to transmit
+     */
     void write(std::string id, std::string msg) {
         int totalWritten = 0;
         // Check if write access
@@ -87,7 +121,7 @@ public:
         std::string& escapedMsg = escape(escape(escape(msg, PREFIX), START), END);
         // Create full message
         std::string fullMsg = std::string(PREFIX) + ":" + std::string(START) + ":" + std::to_string(escapedId.size()) + ":" + std::to_string(escapedMsg.size()) + ":" + escapedId + ":" + escapedMsg + ":" + std::string(END) + ":";
-        // Transmit message
+        // Loop until everything is written, we have to loop since ::write doesn't guarantee to write everything
         while (totalWritten < msg.length()) {
             int written = ::write(m_fd, &fullMsg.c_str()[totalWritten], fullMsg.length() - totalWritten);
             if (written == -1) {
@@ -99,19 +133,36 @@ public:
     }
 
 private:
+    // Name (path) of the named pipe
     std::string m_name;
+    // Access type
     PipeAccess m_access;
+    // File descriptor of the opened named pipe
     int m_fd;
+    // Atomic boolean to notify reader thread of exit
     std::atomic<bool> m_hasToStop;
+    // Reader thread handle
     std::unique_ptr<std::thread> m_reader;
+    // Map of message identifiers associated with its callback
     std::map<std::string, std::function<void(std::string const&)>> m_callbacks;
 
+    /*
+     * \brief Pipe message consisting of identifier, content and total length
+     */
     struct PipeMessage {
+        // Identifier of the message
         std::string id;
+        // Message content
         std::string content;
+        // Number of characters read from input buffer
         size_t totalLength;
     };
 
+    /*
+     * \brief Get next available message
+     * \param input Input buffer containing characters from named pipe
+     * \param filled Number of characters filled in input buffer
+     */
     PipeMessage nextMessage(std::string const& input, size_t filled) {
         static const std::string prefix = std::string(PREFIX) + ":" + std::string(START) + ":";
         size_t posPrefix = 0;
@@ -168,6 +219,11 @@ private:
         return msg;
     }
 
+    /*
+     * \brief Revert previously escaped tag
+     * \param str Input string
+     * \param tag Tag to unescape
+     */
     std::string& unescape(std::string& str, const char* const tag) {
         size_t pos = 0;
         static size_t const tagLength = std::strlen(tag);
@@ -180,6 +236,11 @@ private:
         return str;
     }
 
+    /*
+     * \brief Escape tag in string
+     * \param str Input string
+     * \param tag Tag to escape
+     */
     std::string& escape(std::string& str, const char* const tag) {
         size_t pos = 0;
         static size_t const tagLength = std::strlen(tag);
@@ -192,6 +253,9 @@ private:
         return str;
     }
 
+    /*
+     * \brief Main reader thread routine that reads all incoming messages and calls the associated callback
+     */
     void handleRead() {
         size_t filled = 0;
         std::string input(INITIAL_BUFFER_SIZE, '\0');
@@ -210,9 +274,11 @@ private:
                     PipeMessage msg = nextMessage(input, filled);
                     // If message is found
                     if (msg.totalLength > 0) {
+                        // If callback is registered for the identifier, call it
                         if (m_callbacks.find(msg.id) != m_callbacks.end()) {
                             m_callbacks[msg.id](msg.content);
                         }
+                        // Remove processed string part
                         input = input.substr(msg.totalLength, std::string::npos);
                         filled = filled - msg.totalLength;
                     } else {
